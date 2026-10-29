@@ -1,0 +1,77 @@
+name: Build patched Bee SDK
+
+# Builds @teamgosh/bee-sdk 6.0.0 from source (gosh-sh/bee-engine, tag v6.0.0) with the
+# public "retry on queue full" patch (NeoRider/Nackl-Digger, pinned commit, AGPL-3.0)
+# and commits the result to ./sdk/
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_dir:
+        description: "Folder that contains app.js (the sdk/ folder is created inside it)"
+        default: "."
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream Bee Engine v6.0.0
+        run: |
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global url."https://github.com/".insteadOf "git@github.com:" --add
+          git clone --depth 1 --branch v6.0.0 https://github.com/gosh-sh/bee-engine.git "$RUNNER_TEMP/bee-engine"
+
+      - name: Download and apply the patch (pinned commit, checksum verified)
+        run: |
+          PATCH="$RUNNER_TEMP/0001-retry-on-queue-full.patch"
+          curl -fsSL -o "$PATCH" \
+            "https://raw.githubusercontent.com/NeoRider12/Nackl-Digger/f6e6c21d9975bc9e28a93b08d024b1f40072d675/bee-engine/0001-retry-on-queue-full.patch"
+          echo "e09c0f5a0c286fcdc7f069df4d0368ce581abb75b31326ff66cf42b721d8532a  $PATCH" | sha256sum -c -
+          cd "$RUNNER_TEMP/bee-engine"
+          git apply --check "$PATCH"
+          git apply "$PATCH"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Install clang/llvm (needed by blst)
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      - name: Build the SDK (wasm-pack)
+        env:
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
+        run: |
+          cd "$RUNNER_TEMP/bee-engine"
+          bash scripts/build_wasm.sh sdk
+
+      - name: Copy the build into the repo
+        env:
+          TARGET: ${{ inputs.target_dir }}
+        run: |
+          mkdir -p "$TARGET/sdk"
+          cp "$RUNNER_TEMP/bee-engine/bee_sdk/pkg/bee_sdk.js" \
+             "$RUNNER_TEMP/bee-engine/bee_sdk/pkg/bee_sdk_bg.wasm" \
+             "$RUNNER_TEMP/bee-engine/bee_sdk/pkg/bee_sdk.d.ts" \
+             "$RUNNER_TEMP/bee-engine/LICENSE.md" \
+             "$TARGET/sdk/"
+          grep -c "set_submit_deadline" "$TARGET/sdk/bee_sdk.js"
+          ls -l "$TARGET/sdk"
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -m "Add patched Bee SDK 6.0.0 (retry on queue full)" || echo "nothing to commit"
+          git push
