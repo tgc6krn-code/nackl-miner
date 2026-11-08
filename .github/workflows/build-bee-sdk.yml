@@ -1,10 +1,17 @@
 name: Build patched Bee SDK
 
-# Builds @teamgosh/bee-sdk 6.0.0 from source (gosh-sh/bee-engine, tag v6.0.0) with the
-# public "retry on queue full" patch (NeoRider/Nackl-Digger, pinned commit, AGPL-3.0),
-# then with the local patch 0002-resend-root-without-event.patch
-# (resend the root when no session interval event arrives),
-# and commits the result to ./sdk/
+# Builds @teamgosh/bee-sdk 6.0.0 from source (gosh-sh/bee-engine, tag v6.0.0) with the four public
+# patches that NeoRider's Nackl-Digger ships (AGPL-3.0; patches 0001-0003 are goblingames' "NewGoblin"
+# delivery + premine, 0004 is NeoRider's polling/difficulty change), pinned to one commit and verified
+# by checksum, and commits the result to ./sdk/
+#
+# What 0001 changes (the reason for this build): every message is signed once and the SAME message is
+# resent with exponential backoff (1..30 s) until it is accepted, seen on chain or expires; message
+# lifetime 240 s (stock: 30-40 s); send timeout 60 s (stock: 10 s, while the node answers in 31-50 s);
+# the seed is read from the chain; a stale session is cancelled AND confirmed in Miner.new.
+# 0002/0003 add premine (the next session is mined while the previous one is submitted).
+#
+# Copy this file to .github/workflows/build-bee-sdk.yml (replacing the old one), then run it.
 
 on:
   workflow_dispatch:
@@ -15,6 +22,9 @@ on:
 
 permissions:
   contents: write
+
+env:
+  PATCH_BASE: https://raw.githubusercontent.com/NeoRider12/Nackl-Digger/42bb509a5c51ebd4b63b4adbd617fdfea1b97d3a/bee-engine
 
 jobs:
   build:
@@ -28,22 +38,37 @@ jobs:
           git config --global url."https://github.com/".insteadOf "git@github.com:" --add
           git clone --depth 1 --branch v6.0.0 https://github.com/gosh-sh/bee-engine.git "$RUNNER_TEMP/bee-engine"
 
-      - name: Download and apply the patch (pinned commit, checksum verified)
+      - name: Download the patches and Cargo.lock (pinned commit, checksums verified)
         run: |
-          PATCH="$RUNNER_TEMP/0001-retry-on-queue-full.patch"
-          curl -fsSL -o "$PATCH" \
-            "https://raw.githubusercontent.com/NeoRider12/Nackl-Digger/f6e6c21d9975bc9e28a93b08d024b1f40072d675/bee-engine/0001-retry-on-queue-full.patch"
-          echo "e09c0f5a0c286fcdc7f069df4d0368ce581abb75b31326ff66cf42b721d8532a  $PATCH" | sha256sum -c -
-          cd "$RUNNER_TEMP/bee-engine"
-          git apply --check "$PATCH"
-          git apply "$PATCH"
+          mkdir -p "$RUNNER_TEMP/patches"
+          cd "$RUNNER_TEMP/patches"
+          for f in \
+            0001-newgoblin-delivery-and-diagnostics.patch \
+            0002-newgoblin-premine.patch \
+            0003-newgoblin-premine-chain-wait.patch \
+            0004-neorider-polling-difficulty-benchmark.patch \
+            Cargo.lock; do
+            curl -fsSL -o "$f" "$PATCH_BASE/$f"
+          done
+          cat > SHA256SUMS <<'SUMS'
+          ddfe28cc5c6ef88f7e7751e0f0e5107dfb9557fc6815a3b16ca6aea0a6dc60b0  0001-newgoblin-delivery-and-diagnostics.patch
+          1588582418a7381786be7e683cfe1510e8b3a8a3bc76cc849c06f91f69f428ff  0002-newgoblin-premine.patch
+          a6538dcf0f8aa5a43ecef6be79e6552d32230042a5db5704584f7795f17f610c  0003-newgoblin-premine-chain-wait.patch
+          24409c27c6972db924700cfe92fa2208aef1a140d234f55e9a27a4a998d472db  0004-neorider-polling-difficulty-benchmark.patch
+          5475d5df319aafe8dafbe613f2cb381274d34017a2cdc69868a7ca736e02a7bd  Cargo.lock
+          SUMS
+          sed -i 's/^ *//' SHA256SUMS
+          sha256sum -c SHA256SUMS
 
-      - name: Apply local patch 0002 (resend root when no session interval event)
+      - name: Apply the patches
         run: |
-          LOCAL="$GITHUB_WORKSPACE/0002-resend-root-without-event.patch"
           cd "$RUNNER_TEMP/bee-engine"
-          git apply --check "$LOCAL"
-          git apply "$LOCAL"
+          sed -i '/^dodex-sdk = /d' bee_wallet/Cargo.toml   # dev-dependency only, as upstream CI
+          for p in 0001-newgoblin-delivery-and-diagnostics 0002-newgoblin-premine 0003-newgoblin-premine-chain-wait 0004-neorider-polling-difficulty-benchmark; do
+            git apply --check "$RUNNER_TEMP/patches/$p.patch"
+            git apply "$RUNNER_TEMP/patches/$p.patch"
+          done
+          cp "$RUNNER_TEMP/patches/Cargo.lock" Cargo.lock
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -74,8 +99,18 @@ jobs:
              "$RUNNER_TEMP/bee-engine/bee_sdk/pkg/bee_sdk.d.ts" \
              "$RUNNER_TEMP/bee-engine/LICENSE.md" \
              "$TARGET/sdk/"
-          grep -c "set_submit_deadline" "$TARGET/sdk/bee_sdk.js"
-          grep -qa "root_resent" "$TARGET/sdk/bee_sdk_bg.wasm" || { echo "patch 0002 is missing from the build"; exit 1; }
+          grep -q "set_submit_policy" "$TARGET/sdk/bee_sdk.js" || { echo "set_submit_policy missing: patch 0001 is not in the build"; exit 1; }
+          grep -q "premine" "$TARGET/sdk/bee_sdk.js" || { echo "premine missing: patch 0002 is not in the build"; exit 1; }
+          cat > "$TARGET/sdk/NOTICE-PATCHES.md" <<'NOTICE'
+          # Modified Bee Engine 6.0.0 (GNU AGPL-3.0)
+
+          Upstream: https://github.com/gosh-sh/bee-engine, tag v6.0.0 (commit 015bc466613e7b7c41f272dc16ba0cacbf0e4d93).
+          Patches (applied in order, unchanged) are published with their source and build instructions at
+          https://github.com/NeoRider12/Nackl-Digger/tree/42bb509a5c51ebd4b63b4adbd617fdfea1b97d3a/bee-engine :
+          0001-0003 by the author of goblingames (delivery with resend of the same message, premine),
+          0004 by NeoRider (polling, difficulty). Build recipe: .github/workflows/build-bee-sdk.yml in this repository.
+          NOTICE
+          sed -i 's/^          //' "$TARGET/sdk/NOTICE-PATCHES.md"
           ls -l "$TARGET/sdk"
 
       - name: Commit
@@ -83,5 +118,5 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
           git add -A
-          git commit -m "Add patched Bee SDK 6.0.0 (retry on queue full + root resend)" || echo "nothing to commit"
+          git commit -m "Add Bee SDK 6.0.0 with NewGoblin delivery + premine patches" || echo "nothing to commit"
           git push
