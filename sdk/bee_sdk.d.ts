@@ -579,21 +579,52 @@ export class Miner {
     free(): void;
     [Symbol.dispose](): void;
     add_tap(x: number, y: number): void;
+    /**
+     * NewGoblin premine: `true` while exactly one worker is alive and it is submitting.
+     */
+    can_premine(): boolean;
+    /**
+     * NewGoblin §E.6: sessions are sequential. The worker reads the seed from the chain
+     * (H1), so the local seed queue no longer gates a start.
+     */
     can_start(): boolean;
+    /**
+     * NewGoblin premine: ends the premine worker quietly (`status_updated` `removed`, seed null,
+     * not corrupted): nothing sent, no seed or chain touched. `false` if there is no premine
+     * worker queued, mining or held (one already submitting is not discarded).
+     */
+    discard_premine(): boolean;
     get_current_block(): Promise<GraphqlBlockData>;
     get_miner_data(): Promise<MinerAccountData>;
     get_reward(): Promise<void>;
+    /**
+     * NewGoblin §E.5 / W8: seed, complexities, commit and interval of the miner contract.
+     */
+    get_session_state(): Promise<any>;
     static new(endpoints: string[], app_id: string, address: string, public_key: string, secret_key: string): Promise<Miner>;
+    /**
+     * NewGoblin premine: like `start`, but the worker mines the session after the one being
+     * submitted, without cancelling anything (`premine_resolved` / `premine_unsafe`), holds it
+     * (`held`, `premine_ready`) and submits it only after `release_submit()`, once no other
+     * worker is left (`premine_released`).
+     */
+    premine(duration_ms: number, callback: Function): void;
+    /**
+     * NewGoblin premine: lets the premine worker submit as soon as no other worker is left
+     * (safe to call early). `false` if there is no premine worker queued, mining or held.
+     */
+    release_submit(): boolean;
     remove_seed(seed: string): void;
     /**
-     * NeoRider patch: retry submissions rejected with "queue is full" (621)
-     * until `deadline_ms` (JS `Date.now()` scale). 0 disables retries.
+     * NewGoblin §E.5: absolute end of the current reward epoch (`Date.now()` scale);
+     * root and proof delivery stop there. 0 = off.
      */
-    set_submit_deadline(deadline_ms: number): void;
+    set_epoch_deadline(epoch_deadline_ms: number): void;
     /**
-     * NeoRider patch: interval between submission retries in ms (clamped to 1000–10000).
+     * NewGoblin §E.5: root / proof delivery deadlines and resend backoff (ms), clamped.
+     * Defaults: 210000, 240000, 1000, 30000.
      */
-    set_submit_retry_ms(ms: number): void;
+    set_submit_policy(root_deadline_ms: number, proof_deadline_ms: number, retry_min_ms: number, retry_max_ms: number): void;
     start(duration_ms: number, callback: Function): void;
     stop(): void;
 }
@@ -1126,6 +1157,13 @@ export class ZkLoginPrepareResult {
 }
 
 /**
+ * NeoRider patch 0004: performance test. Computes leaves exactly like the miner does (same
+ * hash function, same leaf layout) for `duration_ms` and returns the measured hash rate.
+ * `{ hashes, leaves, ms, hashes_per_sec }` – leaves = how many met `complexity`.
+ */
+export function benchmark_hashes(complexity: number, duration_ms: number): any;
+
+/**
  * Free function (no `Wallet` instance, no api_url/app_id): deploy a flat
  * Multisig on shellnet, funding the future address from the default giver.
  * Always returns the owner keypair — the frontend MUST persist `secret`.
@@ -1227,6 +1265,7 @@ export interface InitOutput {
     readonly beeconnect_wait_challenge_response: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: number, m: number) => any;
     readonly beeconnect_wait_set_mining_keys_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: number, k: number, l: number, m: number) => any;
     readonly beeconnect_wait_wallet_hello: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: number, m: number) => any;
+    readonly benchmark_hashes: (a: number, b: number) => any;
     readonly connectsessionmessage_body_decrypted: (a: number) => number;
     readonly connectsessionmessage_body_json: (a: number) => [number, number];
     readonly connectsessionmessage_challenge_epk_public: (a: number) => [number, number];
@@ -1270,14 +1309,19 @@ export interface InitOutput {
     readonly issbase64details_index_mod4: (a: number) => number;
     readonly issbase64details_value: (a: number) => [number, number];
     readonly miner_add_tap: (a: number, b: number, c: number) => [number, number];
+    readonly miner_can_premine: (a: number) => number;
     readonly miner_can_start: (a: number) => number;
+    readonly miner_discard_premine: (a: number) => number;
     readonly miner_get_current_block: (a: number) => any;
     readonly miner_get_miner_data: (a: number) => any;
     readonly miner_get_reward: (a: number) => any;
+    readonly miner_get_session_state: (a: number) => any;
     readonly miner_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => any;
+    readonly miner_premine: (a: number, b: number, c: any) => [number, number];
+    readonly miner_release_submit: (a: number) => number;
     readonly miner_remove_seed: (a: number, b: number, c: number) => void;
-    readonly miner_set_submit_deadline: (a: number, b: number) => void;
-    readonly miner_set_submit_retry_ms: (a: number, b: number) => void;
+    readonly miner_set_epoch_deadline: (a: number, b: number) => void;
+    readonly miner_set_submit_policy: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly miner_start: (a: number, b: number, c: any) => [number, number];
     readonly miner_stop: (a: number) => void;
     readonly multifactoraccountdata_candidate_new_owner_pubkey_and_expiration: (a: number) => any;
@@ -1520,23 +1564,23 @@ export interface InitOutput {
     readonly tc_request_ptr: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly tc_request_sync: (a: number, b: number, c: number) => number;
     readonly tc_destroy_context: (a: number) => void;
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke___js_sys_5010b9f6af04d4f6___Function_fn_wasm_bindgen_b40c16f73b602fbf___JsValue_____wasm_bindgen_b40c16f73b602fbf___sys__Undefined___js_sys_5010b9f6af04d4f6___Function_fn_wasm_bindgen_b40c16f73b602fbf___JsValue_____wasm_bindgen_b40c16f73b602fbf___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke___wasm_bindgen_b40c16f73b602fbf___JsValue__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_b40c16f73b602fbf___JsError___true_: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke___web_sys_d7fb6bdf9604c4d9___features__gen_IdbVersionChangeEvent__IdbVersionChangeEvent__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_b40c16f73b602fbf___JsValue___true_: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke___wasm_bindgen_b40c16f73b602fbf___JsValue______true_: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke___wasm_bindgen_b40c16f73b602fbf___JsValue______true__323: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke___wasm_bindgen_b40c16f73b602fbf___JsValue______true__325: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke___web_sys_d7fb6bdf9604c4d9___features__gen_Event__Event______true_: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke_______true_: (a: number, b: number) => void;
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke_______true__1_: (a: number, b: number) => void;
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke_______true__2_: (a: number, b: number) => void;
-    readonly wasm_bindgen_b40c16f73b602fbf___convert__closures_____invoke_______true__3_: (a: number, b: number) => void;
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke___js_sys_a3c89b48c6dbdd90___Function_fn_wasm_bindgen_cc100b7a3d96d60___JsValue_____wasm_bindgen_cc100b7a3d96d60___sys__Undefined___js_sys_a3c89b48c6dbdd90___Function_fn_wasm_bindgen_cc100b7a3d96d60___JsValue_____wasm_bindgen_cc100b7a3d96d60___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke___wasm_bindgen_cc100b7a3d96d60___JsValue__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_cc100b7a3d96d60___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke___web_sys_91ce45d0b4632b3b___features__gen_IdbVersionChangeEvent__IdbVersionChangeEvent__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_cc100b7a3d96d60___JsValue___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke___wasm_bindgen_cc100b7a3d96d60___JsValue______true_: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke___wasm_bindgen_cc100b7a3d96d60___JsValue______true__328: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke___wasm_bindgen_cc100b7a3d96d60___JsValue______true__331: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke___web_sys_91ce45d0b4632b3b___features__gen_Event__Event______true_: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke_______true_: (a: number, b: number) => void;
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke_______true__1_: (a: number, b: number) => void;
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke_______true__2_: (a: number, b: number) => void;
+    readonly wasm_bindgen_cc100b7a3d96d60___convert__closures_____invoke_______true__3_: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
+    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_destroy_closure: (a: number, b: number) => void;
     readonly __externref_table_dealloc: (a: number) => void;
     readonly __externref_drop_slice: (a: number, b: number) => void;
