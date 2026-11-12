@@ -10,6 +10,9 @@ name: Build patched Bee SDK
 # lifetime 240 s (stock: 30-40 s); send timeout 60 s (stock: 10 s, while the node answers in 31-50 s);
 # the seed is read from the chain; a stale session is cancelled AND confirmed in Miner.new.
 # 0002/0003 add premine (the next session is mined while the previous one is submitted).
+# 0005 is OUR OWN patch (patches/0005-nackl-proof-persistence-cancel-confirm.patch in this repository): the proof
+# is signed again and delivered until the whole proof window is over instead of cancelling the commit at once,
+# and a cancel is waited for on the chain ("accepted by the node" is not "executed"), registry sections 46-47.
 #
 # Copy this file to .github/workflows/build-bee-sdk.yml (replacing the old one), then run it.
 
@@ -59,12 +62,14 @@ jobs:
           SUMS
           sed -i 's/^ *//' SHA256SUMS
           sha256sum -c SHA256SUMS
+          # our own patch 0005 comes from this repository (checked out above)
+          cp "$GITHUB_WORKSPACE/patches/0005-nackl-proof-persistence-cancel-confirm.patch" .
 
       - name: Apply the patches
         run: |
           cd "$RUNNER_TEMP/bee-engine"
           sed -i '/^dodex-sdk = /d' bee_wallet/Cargo.toml   # dev-dependency only, as upstream CI
-          for p in 0001-newgoblin-delivery-and-diagnostics 0002-newgoblin-premine 0003-newgoblin-premine-chain-wait 0004-neorider-polling-difficulty-benchmark; do
+          for p in 0001-newgoblin-delivery-and-diagnostics 0002-newgoblin-premine 0003-newgoblin-premine-chain-wait 0004-neorider-polling-difficulty-benchmark 0005-nackl-proof-persistence-cancel-confirm; do
             git apply --check "$RUNNER_TEMP/patches/$p.patch"
             git apply "$RUNNER_TEMP/patches/$p.patch"
           done
@@ -101,6 +106,7 @@ jobs:
              "$TARGET/sdk/"
           grep -q "set_submit_policy" "$TARGET/sdk/bee_sdk.js" || { echo "set_submit_policy missing: patch 0001 is not in the build"; exit 1; }
           grep -q "premine" "$TARGET/sdk/bee_sdk.js" || { echo "premine missing: patch 0002 is not in the build"; exit 1; }
+          grep -q "still on chain" "$TARGET/sdk/bee_sdk_bg.wasm" || { echo "patch 0005 is not in the build"; exit 1; }
           cat > "$TARGET/sdk/NOTICE-PATCHES.md" <<'NOTICE'
           # Modified Bee Engine 6.0.0 (GNU AGPL-3.0)
 
@@ -108,7 +114,7 @@ jobs:
           Patches (applied in order, unchanged) are published with their source and build instructions at
           https://github.com/NeoRider12/Nackl-Digger/tree/42bb509a5c51ebd4b63b4adbd617fdfea1b97d3a/bee-engine :
           0001-0003 by the author of goblingames (delivery with resend of the same message, premine),
-          0004 by NeoRider (polling, difficulty). Build recipe: .github/workflows/build-bee-sdk.yml in this repository.
+          0004 by NeoRider (polling, difficulty); 0005 is our own (patches/ in this repository, same AGPL-3.0). Build recipe: .github/workflows/build-bee-sdk.yml in this repository.
           NOTICE
           sed -i 's/^          //' "$TARGET/sdk/NOTICE-PATCHES.md"
           ls -l "$TARGET/sdk"
@@ -118,5 +124,5 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
           git add -A
-          git commit -m "Add Bee SDK 6.0.0 with NewGoblin delivery + premine patches" || echo "nothing to commit"
+          git commit -m "Add Bee SDK 6.0.0 with NewGoblin delivery + premine patches + own 0005" || echo "nothing to commit"
           git push
