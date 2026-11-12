@@ -19,7 +19,7 @@ index 93bf5f0..b8816d7 100644
  
  #[cfg(not(feature = "single-wasm"))]
 diff --git a/bee_miner/src/wasm/worker.rs b/bee_miner/src/wasm/worker.rs
-index fa39975..d8a5e59 100644
+index fa39975..0ce70f6 100644
 --- a/bee_miner/src/wasm/worker.rs
 +++ b/bee_miner/src/wasm/worker.rs
 @@ -56,7 +56,7 @@ use crate::wasm::DecodedSessionStatusData;
@@ -153,6 +153,15 @@ index fa39975..d8a5e59 100644
  pub(crate) async fn cancel_stale_commit(
      worker: &MinerWorker,
      reason: &str,
+@@ -1255,7 +1299,7 @@ pub(crate) async fn cancel_stale_commit(
+         Err(_) => {}
+     }
+     let result = match prepare(worker, "cancelCommitData", json!(params), signer).await {
+-        Ok(msg) => delivery::deliver(
++        Ok(msg) => match delivery::deliver(
+             worker.send_contract.context().clone(),
+             &msg,
+             "cancel",
 @@ -1267,8 +1311,16 @@ pub(crate) async fn cancel_stale_commit(
              &|| worker.dropped.get(),
          )
