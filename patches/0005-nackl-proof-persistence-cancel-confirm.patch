@@ -1,0 +1,174 @@
+diff --git a/bee_miner/src/wasm/miner.rs b/bee_miner/src/wasm/miner.rs
+index 93bf5f0..b8816d7 100644
+--- a/bee_miner/src/wasm/miner.rs
++++ b/bee_miner/src/wasm/miner.rs
+@@ -562,8 +562,13 @@ async fn cancel_on_new(
+         &|| false,
+     )
+     .await
+-    .map(|_| ())
+-    .map_err(|e| format!("{}: {}", e.kind, e.message))
++    .map_err(|e| format!("{}: {}", e.kind, e.message))?;
++    // Patch 0005: "accepted" by the node is not "executed": wait for the chain.
++    if worker::wait_cancel_executed(contract, &|| false).await {
++        Ok(())
++    } else {
++        Err("cancel accepted but _commitData still on chain".to_string())
++    }
+ }
+ 
+ #[cfg(not(feature = "single-wasm"))]
+diff --git a/bee_miner/src/wasm/worker.rs b/bee_miner/src/wasm/worker.rs
+index fa39975..d8a5e59 100644
+--- a/bee_miner/src/wasm/worker.rs
++++ b/bee_miner/src/wasm/worker.rs
+@@ -56,7 +56,7 @@ use crate::wasm::DecodedSessionStatusData;
+ /// `MAX_LEN_TAPS` (mvsystem modifiers.sol:73): `setCommitData` requires `_tapsSize <= 10`.
+ const MAX_LEN_TAPS: u128 = 10;
+ /// Account reads are retried this many times before the session gives up (W1).
+-const READ_ATTEMPTS: u32 = 3;
++const READ_ATTEMPTS: u32 = 6;
+ /// Poll period of the chain fallbacks (interval, root settle).
+ const CHAIN_POLL_MS: u32 = 3_000;
+ /// How long to wait for `TapSucceed`/`TapFailed` once `acceptTap` is delivered.
+@@ -64,6 +64,10 @@ const RESULT_WAIT_MS: u64 = 90_000;
+ /// The interval is emitted in the root's own transaction: once the root landed it is readable at
+ /// once (event or `_commitInterval`), so this only absorbs indexing / read lag.
+ const INTERVAL_WAIT_MS: u64 = 60_000;
++/// Patch 0005: how long a cancel the node accepted may take to show on chain.
++pub(crate) const CANCEL_SETTLE_MS: u64 = 45_000;
++/// Patch 0005: a proof is re-signed only if at least this much of the proof window is left.
++const PROOF_RESIGN_MIN_MS: u64 = 20_000;
+ 
+ #[derive(Clone)]
+ pub(crate) enum MinerCommand {
+@@ -239,7 +243,7 @@ async fn read_session_state_retry(
+     let mut last = String::new();
+     for attempt in 0..READ_ATTEMPTS {
+         if attempt > 0 {
+-            gloo_timers::future::TimeoutFuture::new(1_000).await;
++            gloo_timers::future::TimeoutFuture::new(2_000).await;
+         }
+         match read_session_state(contract).await {
+             Ok(state) => return Ok(state),
+@@ -676,7 +680,7 @@ pub(crate) async fn run(
+             return;
+         }
+     };
+-    let proof_msg = match prepare(&worker, "acceptTap", json!(proof_params), signer.clone()).await {
++    let mut proof_msg = match prepare(&worker, "acceptTap", json!(proof_params), signer.clone()).await {
+         Ok(msg) => msg,
+         Err(e) => {
+             proof_failed(&worker, &workers_ref, &callback, &data_hex, e).await;
+@@ -690,26 +694,45 @@ pub(crate) async fn run(
+     let result: RefCell<Option<MinerCommand>> = RefCell::new(None);
+     let policy = worker.policy.get();
+     // W6: proof_deadline from the interval, and the message expiry; not the epoch end.
+-    let proof_result = delivery::deliver(
+-        worker.send_contract.context().clone(),
+-        &proof_msg,
+-        "proof",
+-        now_ms() + policy.proof_deadline_ms,
+-        0,
+-        policy,
+-        || async {
+-            if take_result(&mut receiver.borrow_mut(), &result) {
+-                return Ok(true);
++    // Patch 0005: one message lives 240 s, the proof window may be longer (up to 600 s by the
++    // submit policy): when a message ran out, sign `acceptTap` again and keep delivering, instead
++    // of cancelling the commit (a cancel passes in ~2.5% of attempts, a late proof can still count).
++    let proof_total_deadline = now_ms() + policy.proof_deadline_ms;
++    let proof_result = loop {
++        let outcome = delivery::deliver(
++            worker.send_contract.context().clone(),
++            &proof_msg,
++            "proof",
++            proof_total_deadline,
++            0,
++            policy,
++            || async {
++                if take_result(&mut receiver.borrow_mut(), &result) {
++                    return Ok(true);
++                }
++                // `_commitData` is cleared only by an accepted session or a cancel, and both
++                // rotate `_seed`; a lagging read from before the root still shows our seed.
++                let state = read_session_state(&worker.contract).await?;
++                Ok(accepted_on_chain(&state, &worker.seed))
++            },
++            &|action, data| send_diag(&callback, worker.id, action, data),
++            &|| worker.dropped.get(),
++        )
++        .await;
++        let again = matches!(&outcome, Err(e) if e.kind == "deadline" || e.kind == "expired")
++            && !worker.dropped.get()
++            && now_ms() + PROOF_RESIGN_MIN_MS < proof_total_deadline;
++        if !again {
++            break outcome;
++        }
++        match prepare(&worker, "acceptTap", json!(proof_params), signer.clone()).await {
++            Ok(msg) => {
++                proof_msg = msg;
++                diag.proof_msg_id = proof_msg.message_id().to_string();
+             }
+-            // `_commitData` is cleared only by an accepted session or a cancel, and both rotate
+-            // `_seed`; a lagging read from before the root still shows our seed.
+-            let state = read_session_state(&worker.contract).await?;
+-            Ok(accepted_on_chain(&state, &worker.seed))
+-        },
+-        &|action, data| send_diag(&callback, worker.id, action, data),
+-        &|| worker.dropped.get(),
+-    )
+-    .await;
++            Err(_) => break outcome,
++        }
++    };
+     let mut worker_receiver = receiver.into_inner();
+     if worker.dropped.get() {
+         return;
+@@ -1232,6 +1255,27 @@ fn take_result(
+ 
+ /// NewGoblin W7: `cancelCommitData`, delivered until `_commitData` is gone.
+ /// Not bounded by the epoch: a stale commit blocks every later session.
++/// Patch 0005: `deliver()` reports a cancel done once the node ACCEPTED it, not once it ran. Wait
++/// until the chain shows `_commitData` gone (an executed cancel also rotates `_seed`), so the
++/// next read of the seed is the new one.
++pub(crate) async fn wait_cancel_executed(
++    contract: &mvsystem::miner::contract::Miner,
++    dropped: &dyn Fn() -> bool,
++) -> bool {
++    let deadline = now_ms() + CANCEL_SETTLE_MS;
++    loop {
++        if let Ok(state) = read_session_state(contract).await {
++            if state.commit_data.is_none() {
++                return true;
++            }
++        }
++        if dropped() || now_ms() >= deadline {
++            return false;
++        }
++        gloo_timers::future::TimeoutFuture::new(CHAIN_POLL_MS).await;
++    }
++}
++
+ pub(crate) async fn cancel_stale_commit(
+     worker: &MinerWorker,
+     reason: &str,
+@@ -1267,8 +1311,16 @@ pub(crate) async fn cancel_stale_commit(
+             &|| worker.dropped.get(),
+         )
+         .await
+-        .map(|_| msg.message_id().to_string())
+-        .map_err(|e| e.message),
++        {
++            Ok(_) => {
++                if wait_cancel_executed(&worker.contract, &|| worker.dropped.get()).await {
++                    Ok(msg.message_id().to_string())
++                } else {
++                    Err("cancel accepted but _commitData still on chain".to_string())
++                }
++            }
++            Err(e) => Err(e.message),
++        },
+         Err(e) => Err(e),
+     };
+     let ok = result.is_ok();
